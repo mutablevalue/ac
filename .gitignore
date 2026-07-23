@@ -1,0 +1,43 @@
+# Build trees
+/.build/
+/build*/
+/cmake-build-*/
+
+# In-source CMake and Ninja output
+/CMakeCache.txt
+/CMakeFiles/
+/CTestTestfile.cmake
+/Testing/
+/_deps/
+/build.ninja
+/cmake_install.cmake
+/compile_commands.json
+/.ninja_deps
+/.ninja_log
+
+# Compiler and linker output
+*.a
+*.dll
+*.dylib
+*.exe
+*.o
+*.obj
+*.so
+*.so.*
+
+# Runtime and user-specific state
+/imgui.ini
+*.log
+
+# Local tooling and editor state
+/.agents/
+/.codex/
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db

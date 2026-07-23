@@ -1,0 +1,3 @@
+# Permit the active local desktop session to create the narrowly scoped virtual mouse.
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
+
