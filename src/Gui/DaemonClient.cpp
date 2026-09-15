@@ -81,6 +81,10 @@ auto DaemonClient::consume_async(const Types::IpcMessage& Message) -> bool {
         ExitRequested = true;
         return true;
     }
+    if (Message.Command == Types::IpcCommand::BindingCaptured && Message.Capture) {
+        PendingCapture = Message.Capture;
+        return true;
+    }
     if (Message.Command == Types::IpcCommand::Error) {
         PendingError = Message.Message;
         return true;
@@ -99,8 +103,10 @@ auto DaemonClient::transact(Types::IpcMessage Request) -> std::expected<Types::I
         }
         auto Response = Connection.receive();
         if (!Response) return std::unexpected{Response.error()};
+        // A captured binding is an unsolicited push, never a response to this request.
         if (Response->Command != Types::IpcCommand::Status &&
-            Response->Command != Types::IpcCommand::ExitRequested) {
+            Response->Command != Types::IpcCommand::ExitRequested &&
+            Response->Command != Types::IpcCommand::BindingCaptured) {
             return Response;
         }
         static_cast<void>(consume_async(*Response));
@@ -122,12 +128,27 @@ auto DaemonClient::set_own_window(const std::uint64_t WindowId) -> std::expected
     return send({.Command = Types::IpcCommand::SetOwnWindow, .WindowId = WindowId});
 }
 
-auto DaemonClient::set_enabled(const bool Enabled) -> std::expected<void, Utils::Error> {
-    return send({.Command = Types::IpcCommand::SetEnabled, .Enabled = Enabled});
+auto DaemonClient::set_enabled(const Types::MouseButton Button, const bool Enabled)
+    -> std::expected<void, Utils::Error> {
+    return send({.Command = Types::IpcCommand::SetEnabled, .Enabled = Enabled, .Button = Button});
 }
 
 auto DaemonClient::request_status() -> std::expected<void, Utils::Error> {
     return send({.Command = Types::IpcCommand::GetStatus});
+}
+
+auto DaemonClient::begin_binding_capture(const std::uint32_t Token) -> std::expected<void, Utils::Error> {
+    PendingCapture.reset();
+    return send({.Command = Types::IpcCommand::BeginBindingCapture,
+                 .Capture = Types::BindingCapture{.Token = Token}});
+}
+
+auto DaemonClient::cancel_binding_capture() -> std::expected<void, Utils::Error> {
+    return send({.Command = Types::IpcCommand::CancelBindingCapture});
+}
+
+auto DaemonClient::take_capture() -> std::optional<Types::BindingCapture> {
+    return std::exchange(PendingCapture, std::nullopt);
 }
 
 auto DaemonClient::poll() -> void {

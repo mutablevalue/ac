@@ -47,6 +47,7 @@ add_library(autoclicker_common STATIC
     src/Ipc/Protocol.cpp
     src/Ipc/Socket.cpp
     src/Utils/Error.cpp
+    src/Utils/KeyNames.cpp
     src/Utils/Logger.cpp
     src/Utils/Paths.cpp
     src/Utils/UniqueFd.cpp
@@ -55,11 +56,20 @@ target_include_directories(autoclicker_common PUBLIC src)
 target_link_libraries(autoclicker_common PUBLIC nlohmann_json::nlohmann_json Threads::Threads)
 autoclicker_target_defaults(autoclicker_common)
 
+# Application discovery is pure POSIX file reading, so it stays out of the X11 library and the
+# tests can exercise its parsers without a display server.
+add_library(autoclicker_desktop STATIC
+    src/Input/ApplicationInventory.cpp
+)
+target_include_directories(autoclicker_desktop PUBLIC src)
+target_link_libraries(autoclicker_desktop PUBLIC autoclicker_common)
+autoclicker_target_defaults(autoclicker_desktop)
+
 add_library(autoclicker_focus STATIC
     src/Input/WindowFocusTracker.cpp
 )
 target_include_directories(autoclicker_focus PUBLIC src)
-target_link_libraries(autoclicker_focus PUBLIC autoclicker_common X11::X11)
+target_link_libraries(autoclicker_focus PUBLIC autoclicker_common autoclicker_desktop X11::X11)
 autoclicker_target_defaults(autoclicker_focus)
 
 add_library(autoclicker_scheduler STATIC
@@ -76,6 +86,7 @@ pkg_check_modules(LIBEVDEV REQUIRED IMPORTED_TARGET libevdev)
 pkg_check_modules(LIBUDEV REQUIRED IMPORTED_TARGET libudev)
 
 add_library(autoclicker_engine STATIC
+    src/Input/DeviceGrab.cpp
     src/Input/InputListener.cpp
     src/Input/VirtualMouse.cpp
 )
@@ -140,7 +151,7 @@ if(AUTOCLICKER_BUILD_GUI)
         src/Gui/Application.cpp
         src/Gui/DaemonClient.cpp
     )
-    target_link_libraries(autoclicker-gui PRIVATE autoclicker_common autoclicker_focus imgui_backend)
+    target_link_libraries(autoclicker-gui PRIVATE autoclicker_common autoclicker_desktop autoclicker_focus imgui_backend)
     autoclicker_target_defaults(autoclicker-gui)
 endif()
 
@@ -148,12 +159,14 @@ if(AUTOCLICKER_BUILD_TESTS)
     enable_testing()
     add_executable(autoclicker_tests
         src/Tests/TestMain.cpp
+        src/Tests/ApplicationInventoryTests.cpp
         src/Tests/ConfigurationTests.cpp
         src/Tests/HotkeyTests.cpp
+        src/Tests/KeyNameTests.cpp
         src/Tests/SchedulerTests.cpp
         src/Tests/ProtocolTests.cpp
     )
-    target_link_libraries(autoclicker_tests PRIVATE autoclicker_scheduler)
+    target_link_libraries(autoclicker_tests PRIVATE autoclicker_scheduler autoclicker_desktop)
     autoclicker_target_defaults(autoclicker_tests)
     add_test(NAME autoclicker_tests COMMAND autoclicker_tests)
 endif()

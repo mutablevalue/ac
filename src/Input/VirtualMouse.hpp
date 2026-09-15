@@ -17,7 +17,7 @@ public:
     auto operator=(const VirtualMouse&) -> VirtualMouse& = delete;
 
     auto initialize() -> std::expected<void, Utils::Error>;
-    auto emit(Types::ClickTransition Transition) -> bool override;
+    auto emit(Types::MouseButton Button, Types::ClickTransition Transition) -> bool override;
     [[nodiscard]] auto ready() const noexcept -> bool;
 
 private:

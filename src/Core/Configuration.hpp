@@ -31,6 +31,4 @@ private:
     Types::ConfigurationData Data;
 };
 
-[[nodiscard]] auto key_chord_name(const Types::KeyChord& Value) -> std::string;
-
 } // namespace Autoclicker::Core

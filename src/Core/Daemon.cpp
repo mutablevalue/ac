@@ -3,7 +3,9 @@
 #include "Core/Configuration.hpp"
 #include "Utils/Logger.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -31,7 +33,10 @@ auto add_epoll(const int Epoll, const int Descriptor) -> bool {
 } // namespace
 
 Daemon::Daemon(std::filesystem::path Path)
-    : SocketPath(std::move(Path)), Scheduler(VirtualMouse), Shutdown(Scheduler) {}
+    : SocketPath(std::move(Path)),
+      LeftScheduler(VirtualMouse, Types::MouseButton::Left),
+      RightScheduler(VirtualMouse, Types::MouseButton::Right),
+      Shutdown(LeftScheduler, RightScheduler) {}
 
 Daemon::~Daemon() {
     Shutdown.begin_shutdown();
@@ -71,8 +76,10 @@ auto Daemon::initialize() -> std::expected<void, Utils::Error> {
 
     if (auto Result = VirtualMouse.initialize(); !Result) LatestError = Result.error().describe();
     Config = Configuration::instance().snapshot();
-    Scheduler.configure(Config, ClickScheduler::Clock::now());
-    Hotkeys.configure(Config.ToggleBinding, Config.ExitBinding);
+    const auto Startup = ClickScheduler::Clock::now();
+    LeftScheduler.configure(Config.Left, Startup);
+    RightScheduler.configure(Config.Right, Startup);
+    Hotkeys.configure(Config.Left.ToggleBinding, Config.Right.ToggleBinding, Config.ExitBinding);
     if (auto Result = FocusTracker.initialize(); !Result) LatestError = Result.error().describe();
     static_cast<void>(refresh_focus(ClickScheduler::Clock::now()));
     if (auto Result = InputListener.start(
@@ -107,14 +114,32 @@ auto Daemon::run() -> std::expected<void, Utils::Error> {
                 Client = std::move(*Accepted);
                 static_cast<void>(add_epoll(Epoll.get(), Client.descriptor()));
             } else if (Client && Descriptor == Client.descriptor()) {
-                if ((Flags & (EPOLLHUP | EPOLLERR)) != 0U) { Shutdown.begin_shutdown(); break; }
+                if ((Flags & (EPOLLHUP | EPOLLERR)) != 0U) {
+                    finish_capture(Types::CaptureOutcome::Cancelled, {});
+                    Shutdown.begin_shutdown();
+                    break;
+                }
                 auto Message = Client.receive();
-                if (!Message) { Shutdown.begin_shutdown(); break; }
+                if (!Message) {
+                    finish_capture(Types::CaptureOutcome::Cancelled, {});
+                    Shutdown.begin_shutdown();
+                    break;
+                }
                 handle_message(*Message);
             } else if (Descriptor == Timer.get()) {
                 auto Expirations = std::uint64_t{};
                 static_cast<void>(read(Timer.get(), &Expirations, sizeof(Expirations)));
-                Scheduler.process(ClickScheduler::Clock::now());
+                const auto Now = ClickScheduler::Clock::now();
+                if (CaptureDeadline && Now >= *CaptureDeadline) {
+                    finish_capture(Types::CaptureOutcome::TimedOut, {});
+                }
+                if (FocusPollDeadline && Now >= *FocusPollDeadline) {
+                    const auto WasAllowed = FocusAllowed;
+                    static_cast<void>(refresh_focus(Now));
+                    if (WasAllowed != FocusAllowed) send_status();
+                }
+                LeftScheduler.process(Now);
+                RightScheduler.process(Now);
                 arm_timer();
             } else if (Descriptor == Signals.get()) {
                 auto Signal = signalfd_siginfo{};
@@ -132,6 +157,8 @@ auto Daemon::run() -> std::expected<void, Utils::Error> {
         }
     }
     Shutdown.begin_shutdown();
+    // Hand the pointer back before the descriptors close rather than relying on kernel cleanup.
+    static_cast<void>(InputListener.set_grab(false, false, false));
     arm_timer();
     Shutdown.mark_stopped();
     return {};
@@ -153,8 +180,12 @@ auto Daemon::handle_message(const Types::IpcMessage& Message) -> void {
             break;
         }
         Config = *Message.Configuration;
-        Scheduler.configure(Config, ClickScheduler::Clock::now());
-        Hotkeys.configure(Config.ToggleBinding, Config.ExitBinding);
+        {
+            const auto Now = ClickScheduler::Clock::now();
+            LeftScheduler.configure(Config.Left, Now);
+            RightScheduler.configure(Config.Right, Now);
+        }
+        Hotkeys.configure(Config.Left.ToggleBinding, Config.Right.ToggleBinding, Config.ExitBinding);
         static_cast<void>(refresh_focus(ClickScheduler::Clock::now()));
         static_cast<void>(Client.send({.Command = Types::IpcCommand::Ack}));
         arm_timer();
@@ -173,11 +204,22 @@ auto Daemon::handle_message(const Types::IpcMessage& Message) -> void {
         }
         const auto Now = ClickScheduler::Clock::now();
         static_cast<void>(refresh_focus(Now));
-        if (Message.Enabled) Shutdown.set_enabled(*Message.Enabled, Now);
+        if (Message.Enabled) {
+            Shutdown.set_enabled(Message.Button.value_or(Types::MouseButton::Left), *Message.Enabled, Now);
+        }
+        update_grab();
         static_cast<void>(Client.send({.Command = Types::IpcCommand::Ack}));
         arm_timer();
         break;
     }
+    case Types::IpcCommand::BeginBindingCapture:
+        begin_capture(Message.Capture ? Message.Capture->Token : 0U, ClickScheduler::Clock::now());
+        static_cast<void>(Client.send({.Command = Types::IpcCommand::Ack}));
+        break;
+    case Types::IpcCommand::CancelBindingCapture:
+        finish_capture(Types::CaptureOutcome::Cancelled, {});
+        static_cast<void>(Client.send({.Command = Types::IpcCommand::Ack}));
+        break;
     case Types::IpcCommand::GetStatus:
         static_cast<void>(refresh_focus(ClickScheduler::Clock::now()));
         send_status();
@@ -193,50 +235,176 @@ auto Daemon::handle_message(const Types::IpcMessage& Message) -> void {
 }
 
 auto Daemon::handle_input(const Types::RawInputEvent& Event) -> void {
-    if (Event.Kind == Types::InputDeviceKind::Keyboard && Event.Type == EV_SYN && Event.Code == SYN_DROPPED) {
+    if (Event.Type == EV_SYN && Event.Code == SYN_DROPPED) {
         Hotkeys.reset();
         return;
     }
     if (Event.Type != EV_KEY) return;
-    if (Event.Kind == Types::InputDeviceKind::Mouse && Event.Code == BTN_LEFT && (Event.Value == 0 || Event.Value == 1)) {
-        const auto Now = ClickScheduler::Clock::now();
-        if (Event.Value == 1) static_cast<void>(refresh_focus(Now));
-        Scheduler.on_physical_button(Event.Value == 1, Now);
-        arm_timer();
+    const auto Now = ClickScheduler::Clock::now();
+
+    if (capture_active()) {
+        // The click that opened the prompt is still in flight; it must not become the binding.
+        if (CaptureArmedAt && Now < *CaptureArmedAt) return;
+        if (Event.Value == 1 && Event.Code == KEY_ESC) {
+            finish_capture(Types::CaptureOutcome::Cancelled, {});
+            return;
+        }
+        if (const auto Chord = Hotkeys.capture(Event.Code, Event.Value)) {
+            finish_capture(Types::CaptureOutcome::Captured, *Chord);
+        }
+        // An armed capture never dispatches a hotkey or feeds a scheduler.
+        return;
     }
-    if (Event.Kind == Types::InputDeviceKind::Keyboard) if (const auto Action = Hotkeys.process(Event.Code, Event.Value)) {
-        if (*Action == Types::HotkeyAction::ToggleAutoclicker) {
-            const auto EnableRequested = !Scheduler.enabled();
-            const auto Now = ClickScheduler::Clock::now();
-            static_cast<void>(refresh_focus(Now));
-            if (EnableRequested && !VirtualMouse.ready()) {
-                Shutdown.set_enabled(false, Now);
-            } else {
-                Shutdown.set_enabled(EnableRequested, Now);
-            }
-            arm_timer();
-            send_status();
-        } else {
+
+    if (Event.Kind == Types::InputDeviceKind::Mouse && (Event.Code == BTN_LEFT || Event.Code == BTN_RIGHT) &&
+        (Event.Value == 0 || Event.Value == 1)) {
+        if (Event.Value == 1) static_cast<void>(refresh_focus(Now));
+        auto& Target = Event.Code == BTN_RIGHT ? RightScheduler : LeftScheduler;
+        Target.on_physical_button(Event.Value == 1, Now);
+    }
+    // Mouse buttons are bindable too, so both kinds reach the hotkey matcher. The listener
+    // guarantees one delivery per physical action.
+    if (const auto Action = Hotkeys.process(Event.Code, Event.Value)) {
+        switch (*Action) {
+        case Types::HotkeyAction::ToggleLeftClicker:
+            toggle_channel(Types::MouseButton::Left);
+            break;
+        case Types::HotkeyAction::ToggleRightClicker:
+            toggle_channel(Types::MouseButton::Right);
+            break;
+        case Types::HotkeyAction::ExitAutoclicker:
             request_exit();
+            break;
         }
     }
+    arm_timer();
+}
+
+auto Daemon::capture_active() const noexcept -> bool { return CaptureDeadline.has_value(); }
+
+auto Daemon::begin_capture(const std::uint32_t Token, const ClickScheduler::TimePoint Now) -> void {
+    CaptureToken = Token;
+    CaptureArmedAt = Now + std::chrono::milliseconds{300};
+    CaptureDeadline = Now + std::chrono::seconds{10};
+    // A running clicker during capture is chaotic, and binding a mouse button needs a clean click.
+    Shutdown.set_enabled(Types::MouseButton::Left, false, Now);
+    Shutdown.set_enabled(Types::MouseButton::Right, false, Now);
+    Hotkeys.reset();
+    update_grab();
+    arm_timer();
+    send_status();
+}
+
+auto Daemon::finish_capture(const Types::CaptureOutcome Outcome, Types::KeyChord Chord) -> void {
+    if (!capture_active()) return;
+    const auto Token = CaptureToken;
+    CaptureDeadline.reset();
+    CaptureArmedAt.reset();
+    CaptureToken = 0;
+    Hotkeys.reset();
+    if (Client) {
+        static_cast<void>(Client.send({.Command = Types::IpcCommand::BindingCaptured,
+            .Capture = Types::BindingCapture{.Token = Token, .Outcome = Outcome, .Chord = Chord}}));
+    }
+    update_grab();
+    arm_timer();
+    send_status();
+}
+
+auto Daemon::grab_required() const -> bool {
+    if (Shutdown.shutting_down() || capture_active()) return false;
+    // Releasing the grab whenever output is disallowed is what keeps the FastClicker window
+    // clickable while a hold channel is armed.
+    if (!FocusAllowed) return false;
+    return (Config.Left.Mode == Types::OperatingMode::Hold && Shutdown.enabled(Types::MouseButton::Left)) ||
+           (Config.Right.Mode == Types::OperatingMode::Hold && Shutdown.enabled(Types::MouseButton::Right));
+}
+
+auto Daemon::update_grab() -> void {
+    // Derived rather than counted, so the two channels can never leave the grab unbalanced.
+    const auto Required = grab_required();
+    const auto SwallowLeft = Required && Config.Left.Mode == Types::OperatingMode::Hold &&
+                             Shutdown.enabled(Types::MouseButton::Left);
+    const auto SwallowRight = Required && Config.Right.Mode == Types::OperatingMode::Hold &&
+                              Shutdown.enabled(Types::MouseButton::Right);
+    if (auto Result = InputListener.set_grab(Required, SwallowLeft, SwallowRight); !Result) {
+        LatestError = Result.error().describe();
+    }
+}
+
+auto Daemon::toggle_channel(const Types::MouseButton Button) -> void {
+    const auto EnableRequested = !Shutdown.enabled(Button);
+    const auto Now = ClickScheduler::Clock::now();
+    static_cast<void>(refresh_focus(Now));
+    Shutdown.set_enabled(Button, EnableRequested && VirtualMouse.ready(), Now);
+    update_grab();
+    arm_timer();
+    send_status();
+}
+
+auto Daemon::channel_status(const ClickScheduler& Scheduler, const ClickScheduler::TimePoint Now) const
+    -> Types::ChannelStatus {
+    return {.Enabled = Scheduler.enabled(), .Mode = Scheduler.mode(),
+            .PhysicalCps = Scheduler.physical_cps(Now), .EmittedCps = Scheduler.emitted_cps(Now),
+            .AdditiveGateOpen = Scheduler.additive_gate_open()};
 }
 
 auto Daemon::status() const -> Types::DaemonStatus {
     const auto Now = ClickScheduler::Clock::now();
-    return {.Lifecycle = Shutdown.state(), .Mode = Config.Mode,
+    return {.Lifecycle = Shutdown.state(),
+            .Left = channel_status(LeftScheduler, Now),
+            .Right = channel_status(RightScheduler, Now),
             .MouseConnected = InputListener.mouse_connected(),
             .FocusTrackingSupported = FocusState.Supported,
-            .FocusAllowed = FocusState.Supported && !FocusState.OwnWindowFocused && FocusState.TargetFocused,
-            .PhysicalCps = Scheduler.physical_cps(Now), .EmittedCps = Scheduler.emitted_cps(Now),
-            .ActiveApplication = FocusState.ActiveApplication,
-            .LatestError = LatestError};
+            .FocusObservable = FocusState.FocusObservable,
+            .FocusAllowed = FocusAllowed,
+            .ActiveApplication = ActiveApplication,
+            .LatestError = LatestError,
+            .CaptureActive = capture_active()};
+}
+
+auto Daemon::matches_target(const std::string_view Identity, const std::string_view WindowClass) const -> bool {
+    if (!Config.TargetApplication) return true;
+    const auto& Target = *Config.TargetApplication;
+    // A target saved before process identities existed holds an X11 window class, so accept either
+    // key. Both are case-insensitive because WM_CLASS capitalisation is purely a toolkit choice.
+    const auto Same = [&Target](const std::string_view Value) {
+        return !Value.empty() && Value.size() == Target.size() &&
+            std::ranges::equal(Value, Target, {}, [](const char Character) {
+                return static_cast<char>(std::tolower(static_cast<unsigned char>(Character)));
+            }, [](const char Character) {
+                return static_cast<char>(std::tolower(static_cast<unsigned char>(Character)));
+            });
+    };
+    return Same(Identity) || Same(WindowClass);
+}
+
+auto Daemon::target_focused(const ClickScheduler::TimePoint Now) -> bool {
+    if (FocusState.FocusObservable) {
+        const auto Identity = Inventory.identify(FocusState.ActiveProcessId);
+        ActiveApplication = !Identity.empty() ? Inventory.display_name(Identity)
+                                              : FocusState.ActiveWindowClass;
+        return matches_target(Identity, FocusState.ActiveWindowClass);
+    }
+    // A Wayland-native client holds focus. Nothing on this session can name it, so fall back to the
+    // strongest signal that remains: whether the target is running at all. The GUI says so plainly.
+    ActiveApplication.clear();
+    if (!Config.TargetApplication) return true;
+    Inventory.refresh_if_stale(Now);
+    return Inventory.running(*Config.TargetApplication);
 }
 
 auto Daemon::refresh_focus(const ClickScheduler::TimePoint Now) -> bool {
-    FocusState = FocusTracker.focus_state(Config.TargetApplication, OwnWindowId);
-    const auto Allowed = FocusState.Supported && !FocusState.OwnWindowFocused && FocusState.TargetFocused;
-    Scheduler.set_output_allowed(Allowed, Now);
+    FocusState = FocusTracker.focus_state(OwnWindowId);
+    const auto Allowed = FocusState.Supported && !FocusState.OwnWindowFocused && target_focused(Now);
+    FocusAllowed = Allowed;
+    // Only poll while the answer can change without an X11 event reaching us.
+    FocusPollDeadline = FocusState.Supported && !FocusState.FocusObservable && Config.TargetApplication
+        ? std::optional{Now + std::chrono::seconds{1}}
+        : std::nullopt;
+    LeftScheduler.set_output_allowed(Allowed, Now);
+    RightScheduler.set_output_allowed(Allowed, Now);
+    update_grab();
     return Allowed;
 }
 
@@ -252,7 +420,14 @@ auto Daemon::request_exit() -> void {
 auto Daemon::arm_timer() -> void {
     auto Specification = itimerspec{};
     if (!Shutdown.shutting_down()) {
-        const auto Deadline = Scheduler.next_deadline();
+        auto Deadline = LeftScheduler.next_deadline();
+        const auto Fold = [&Deadline](const std::optional<ClickScheduler::TimePoint>& Other) {
+            if (!Other) return;
+            Deadline = Deadline ? std::optional{std::min(*Deadline, *Other)} : Other;
+        };
+        Fold(RightScheduler.next_deadline());
+        Fold(CaptureDeadline);
+        Fold(FocusPollDeadline);
         if (Deadline) {
             const auto Nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(Deadline->time_since_epoch()).count();
             Specification.it_value.tv_sec = static_cast<time_t>(Nanoseconds / 1'000'000'000LL);

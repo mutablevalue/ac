@@ -22,8 +22,11 @@ public:
     auto shutdown() -> void;
     auto set_configuration(const Types::ConfigurationData& Value) -> std::expected<void, Utils::Error>;
     auto set_own_window(std::uint64_t WindowId) -> std::expected<void, Utils::Error>;
-    auto set_enabled(bool Enabled) -> std::expected<void, Utils::Error>;
+    auto set_enabled(Types::MouseButton Button, bool Enabled) -> std::expected<void, Utils::Error>;
     auto request_status() -> std::expected<void, Utils::Error>;
+    auto begin_binding_capture(std::uint32_t Token) -> std::expected<void, Utils::Error>;
+    auto cancel_binding_capture() -> std::expected<void, Utils::Error>;
+    [[nodiscard]] auto take_capture() -> std::optional<Types::BindingCapture>;
     auto poll() -> void;
 
     [[nodiscard]] auto connected() const noexcept -> bool;
@@ -47,6 +50,7 @@ private:
     std::optional<Types::DaemonStatus> CachedStatus;
     std::uint64_t StatusRevision{};
     std::optional<std::string> PendingError;
+    std::optional<Types::BindingCapture> PendingCapture;
 };
 
 } // namespace Autoclicker::Gui

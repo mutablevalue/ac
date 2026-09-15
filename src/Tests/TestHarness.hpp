@@ -10,8 +10,10 @@ inline auto require(const bool Condition, const std::string_view Message) -> voi
     if (!Condition) throw std::runtime_error{std::string{Message}};
 }
 
+auto application_inventory_tests() -> void;
 auto configuration_tests() -> void;
 auto hotkey_tests() -> void;
+auto key_name_tests() -> void;
 auto scheduler_tests() -> void;
 auto protocol_tests() -> void;
 

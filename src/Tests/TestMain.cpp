@@ -4,8 +4,10 @@
 
 auto main() -> int {
     try {
+        Autoclicker::Tests::application_inventory_tests();
         Autoclicker::Tests::configuration_tests();
         Autoclicker::Tests::hotkey_tests();
+        Autoclicker::Tests::key_name_tests();
         Autoclicker::Tests::scheduler_tests();
         Autoclicker::Tests::protocol_tests();
         std::cout << "All FastClicker tests passed\n";

@@ -7,6 +7,11 @@
 #include <linux/input.h>
 
 namespace Autoclicker::Input {
+namespace {
+auto button_code(const Types::MouseButton Button) -> unsigned int {
+    return Button == Types::MouseButton::Right ? BTN_RIGHT : BTN_LEFT;
+}
+} // namespace
 
 VirtualMouse::~VirtualMouse() {
     if (Device != nullptr) libevdev_uinput_destroy(Device);
@@ -24,6 +29,7 @@ auto VirtualMouse::initialize() -> std::expected<void, Utils::Error> {
     libevdev_set_id_version(Definition, 0x0001U);
     auto Result = libevdev_enable_event_type(Definition, EV_KEY);
     if (Result >= 0) Result = libevdev_enable_event_code(Definition, EV_KEY, BTN_LEFT, nullptr);
+    if (Result >= 0) Result = libevdev_enable_event_code(Definition, EV_KEY, BTN_RIGHT, nullptr);
     if (Result >= 0) Result = libevdev_enable_event_type(Definition, EV_REL);
     if (Result >= 0) Result = libevdev_enable_event_code(Definition, EV_REL, REL_X, nullptr);
     if (Result >= 0) Result = libevdev_enable_event_code(Definition, EV_REL, REL_Y, nullptr);
@@ -38,10 +44,10 @@ auto VirtualMouse::initialize() -> std::expected<void, Utils::Error> {
     return {};
 }
 
-auto VirtualMouse::emit(const Types::ClickTransition Transition) -> bool {
+auto VirtualMouse::emit(const Types::MouseButton Button, const Types::ClickTransition Transition) -> bool {
     if (Device == nullptr) return false;
     const auto Value = Transition == Types::ClickTransition::Press ? 1 : 0;
-    if (libevdev_uinput_write_event(Device, EV_KEY, BTN_LEFT, Value) < 0) return false;
+    if (libevdev_uinput_write_event(Device, EV_KEY, button_code(Button), Value) < 0) return false;
     return libevdev_uinput_write_event(Device, EV_SYN, SYN_REPORT, 0) >= 0;
 }
 

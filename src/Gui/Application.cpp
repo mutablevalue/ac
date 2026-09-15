@@ -1,11 +1,11 @@
 #include "Gui/Application.hpp"
 
 #include "Core/Configuration.hpp"
+#include "Utils/KeyNames.hpp"
 #include "Utils/Logger.hpp"
 #include "Utils/Paths.hpp"
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cstdint>
 #include <imgui.h>
@@ -26,14 +26,14 @@ auto glfw_error(const int, const char* Description) -> void {
         Types::LogLevel::Error, Description == nullptr ? "GLFW error" : Description);
 }
 
-constexpr auto BindableKeys = std::array{
-    std::pair{KEY_F1, "F1"}, std::pair{KEY_F2, "F2"}, std::pair{KEY_F3, "F3"},
-    std::pair{KEY_F4, "F4"}, std::pair{KEY_F5, "F5"}, std::pair{KEY_F6, "F6"},
-    std::pair{KEY_F7, "F7"}, std::pair{KEY_F8, "F8"}, std::pair{KEY_F9, "F9"},
-    std::pair{KEY_F10, "F10"}, std::pair{KEY_F11, "F11"}, std::pair{KEY_F12, "F12"},
-    std::pair{KEY_INSERT, "Insert"}, std::pair{KEY_DELETE, "Delete"},
-    std::pair{KEY_HOME, "Home"}, std::pair{KEY_END, "End"},
-};
+constexpr auto WarningColour = ImVec4{1.0F, 0.55F, 0.35F, 1.0F};
+
+// Worst-case span of one burst, used to show the rate ceiling a multiplier implies.
+auto burst_span_ms(const Types::ChannelConfiguration& Channel) -> int {
+    const auto Pairs = static_cast<int>(Channel.ClickMultiplier);
+    const auto Gap = static_cast<int>(Channel.MultiplierGap.count());
+    return (Pairs - 1) * Gap + Pairs * std::min(Gap / 2, 20);
+}
 } // namespace
 
 auto Application::initialize() -> bool {
@@ -60,7 +60,7 @@ auto Application::initialize() -> bool {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
-    Window = glfwCreateWindow(660, 620, "FastClicker", nullptr, nullptr);
+    Window = glfwCreateWindow(660, 760, "FastClicker", nullptr, nullptr);
     if (Window == nullptr) {
         set_error("Unable to create the FastClicker window");
         return false;
@@ -129,14 +129,16 @@ auto Application::run() -> int {
         glfwSwapBuffers(Window);
     }
 
-    Enabled = false;
+    LeftEnabled = false;
+    RightEnabled = false;
     if (ConfigDirty) {
         auto& Configuration = Core::Configuration::instance();
         if (Configuration.update(Config)) {
             static_cast<void>(Configuration.save(Utils::Paths::config_file()));
         }
     }
-    static_cast<void>(Daemon.set_enabled(false));
+    static_cast<void>(Daemon.set_enabled(Types::MouseButton::Left, false));
+    static_cast<void>(Daemon.set_enabled(Types::MouseButton::Right, false));
     Daemon.shutdown();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
@@ -154,71 +156,32 @@ auto Application::render() -> void {
     ImGui::Begin("FastClicker", nullptr, WindowFlags);
 
     if (const auto& Status = Daemon.cached_status(); Status && Daemon.status_revision() != LastStatusRevision) {
-        Enabled = Status->Lifecycle == Types::LifecycleState::Enabled;
+        LeftEnabled = Status->Left.Enabled;
+        RightEnabled = Status->Right.Enabled;
         LastStatusRevision = Daemon.status_revision();
     }
 
-    ImGui::SetNextItemWidth(120.0F);
-    if (ImGui::Checkbox("Enabled", &Enabled)) {
-        if (auto Result = Daemon.set_enabled(Enabled); !Result) {
-            Enabled = false;
-            set_error(Result.error().describe());
-        }
-    }
-    ImGui::SameLine();
     const auto ExitWidth = ImGui::CalcTextSize("Exit").x + ImGui::GetStyle().FramePadding.x * 2.0F;
     ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowContentRegionMax().x - ExitWidth));
     if (ImGui::Button("Exit")) Running = false;
 
-    ImGui::SeparatorText("Click behavior");
-    auto Changed = false;
-    auto Mode = static_cast<int>(Config.Mode);
-    Changed |= ImGui::RadioButton("Normal", &Mode, static_cast<int>(Types::OperatingMode::Normal));
-    ImGui::SameLine();
-    Changed |= ImGui::RadioButton("Additive", &Mode, static_cast<int>(Types::OperatingMode::Additive));
-    Config.Mode = static_cast<Types::OperatingMode>(Mode);
-    ImGui::TextDisabled(Config.Mode == Types::OperatingMode::Normal
-                            ? "Clicks continuously while enabled."
-                            : "Fills physical clicking up to the configured target rate.");
-
-    auto Unit = static_cast<int>(Config.Unit);
-    Changed |= ImGui::RadioButton("Use CPS", &Unit, static_cast<int>(Types::RateUnit::Cps));
-    ImGui::SameLine();
-    Changed |= ImGui::RadioButton("Use MS", &Unit, static_cast<int>(Types::RateUnit::Milliseconds));
-    Config.Unit = static_cast<Types::RateUnit>(Unit);
-
-    if (Config.Unit == Types::RateUnit::Cps) {
-        auto Cps = static_cast<int>(Config.Cps);
-        Changed |= draw_numeric_control("CPS", Cps, 1, 1000, Types::NumericEditTarget::Rate);
-        Config.Cps = static_cast<std::uint16_t>(Cps);
-    } else {
-        auto Delay = static_cast<int>(Config.Delay.count());
-        Changed |= draw_numeric_control("Delay (MS)", Delay, 1, 10000, Types::NumericEditTarget::Rate);
-        Config.Delay = std::chrono::milliseconds{Delay};
-    }
-
-    auto Offset = static_cast<int>(Config.RateOffset);
-    const auto OffsetMaximum = Config.Unit == Types::RateUnit::Cps ? 1000 : 10000;
-    Changed |= draw_numeric_control(
-        Config.Unit == Types::RateUnit::Cps ? "Offset (CPS)" : "Offset (MS)",
-        Offset, 0, OffsetMaximum, Types::NumericEditTarget::Offset);
-    Config.RateOffset = static_cast<std::uint16_t>(Offset);
-
-    if (Config.Unit == Types::RateUnit::Cps) {
-        const auto Minimum = std::max(1, static_cast<int>(Config.Cps) - Offset);
-        const auto Maximum = std::min(1000, static_cast<int>(Config.Cps) + Offset);
-        ImGui::TextDisabled("Effective range: %d-%d CPS", Minimum, Maximum);
-    } else {
-        const auto Base = static_cast<int>(Config.Delay.count());
-        ImGui::TextDisabled("Effective range: %d-%d MS", std::max(1, Base - Offset),
-                            std::min(10000, Base + Offset));
-    }
+    auto Changed = apply_capture();
+    Changed |= draw_channel("Left button", Config.Left, Types::MouseButton::Left, LeftEnabled,
+                            Types::NumericEditTarget::LeftRate, Types::NumericEditTarget::LeftOffset,
+                            Types::NumericEditTarget::LeftStart,
+                            Types::NumericEditTarget::LeftMultiplier, Types::NumericEditTarget::LeftGap,
+                            Types::BindingTarget::LeftToggle);
+    Changed |= draw_channel("Right button", Config.Right, Types::MouseButton::Right, RightEnabled,
+                            Types::NumericEditTarget::RightRate, Types::NumericEditTarget::RightOffset,
+                            Types::NumericEditTarget::RightStart,
+                            Types::NumericEditTarget::RightMultiplier, Types::NumericEditTarget::RightGap,
+                            Types::BindingTarget::RightToggle);
     ImGui::TextDisabled("Double-click a bar to type an exact value.");
 
     ImGui::SeparatorText("Application focus");
     ImGui::Text("Target: %s", Config.TargetApplication ? Config.TargetApplication->c_str() : "Any application");
     if (ImGui::Button("Choose process...")) {
-        refresh_window_candidates();
+        refresh_application_candidates();
         ImGui::OpenPopup("Choose process");
     }
     if (Config.TargetApplication) {
@@ -229,22 +192,28 @@ auto Application::render() -> void {
         }
     }
     if (ImGui::BeginPopupModal("Choose process", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextUnformatted("FastClicker will only generate clicks while this application is focused.");
+        ImGui::TextUnformatted("FastClicker will only generate clicks while this application is active.");
         ImGui::Separator();
-        if (WindowCandidates.empty()) {
-            ImGui::TextDisabled("No selectable X11/XWayland applications are currently open.");
+        if (ApplicationCandidates.empty()) {
+            ImGui::TextDisabled("No running applications were found.");
         }
-        for (const auto& Candidate : WindowCandidates) {
-            const auto Label = Candidate.Title.empty()
-                ? Candidate.Application
-                : Candidate.Title + "###" + Candidate.Application;
-            if (ImGui::Selectable(Label.c_str(), Config.TargetApplication == Candidate.Application)) {
-                Config.TargetApplication = Candidate.Application;
+        for (const auto& Candidate : ApplicationCandidates) {
+            const auto Label = Candidate.DisplayName + "###" + Candidate.Identity;
+            if (ImGui::Selectable(Label.c_str(), Config.TargetApplication == Candidate.Identity)) {
+                Config.TargetApplication = Candidate.Identity;
                 Changed = true;
                 ImGui::CloseCurrentPopup();
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Application: %s\nPID: %u", Candidate.Application.c_str(), Candidate.ProcessId);
+                ImGui::SetTooltip("Identity: %s\nPID: %u\n%s", Candidate.Identity.c_str(),
+                                  Candidate.ProcessId,
+                                  Candidate.Source == Types::ApplicationSource::Window
+                                      ? "Has an X11 window: focus is tracked exactly."
+                                      : "Wayland-native: gated on the app running, not on focus.");
+            }
+            if (Candidate.Source != Types::ApplicationSource::Window) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(Wayland)");
             }
         }
         ImGui::Separator();
@@ -254,8 +223,7 @@ auto Application::render() -> void {
     ImGui::TextDisabled("The FastClicker window is always blocked.");
 
     ImGui::SeparatorText("Global shortcuts");
-    Changed |= draw_binding("Toggle autoclicker", Config.ToggleBinding);
-    Changed |= draw_binding("Exit autoclicker", Config.ExitBinding);
+    Changed |= draw_binding("Exit autoclicker", Config.ExitBinding, Types::BindingTarget::Exit);
 
     if (Changed) {
         ConfigDirty = true;
@@ -272,13 +240,21 @@ auto Application::render() -> void {
             ? Status->FocusAllowed ? "Enabled" : "Enabled - waiting for focus"
             : "Disabled";
         ImGui::Text("State: %s", StateName);
-        ImGui::Text("Physical: %.0f CPS    Added: %.0f CPS", Status->PhysicalCps, Status->EmittedCps);
+        draw_channel_status("Left", Status->Left, Config.Left);
+        draw_channel_status("Right", Status->Right, Config.Right);
         ImGui::Text("Mouse input: Automatic (%s)", Status->MouseConnected ? "connected" : "waiting");
         if (!Status->ActiveApplication.empty()) {
             ImGui::Text("Focused application: %s", Status->ActiveApplication.c_str());
         }
         if (!Status->FocusTrackingSupported) {
             ImGui::TextColored({1.0F, 0.55F, 0.35F, 1.0F}, "Window focus tracking is unavailable; clicking is blocked.");
+        } else if (!Status->FocusObservable && Config.TargetApplication) {
+            // Saying "focused application: unknown" would be worse than explaining why it is unknown.
+            ImGui::TextColored({1.0F, 0.8F, 0.35F, 1.0F},
+                               "A Wayland app is focused; the compositor does not say which.");
+            ImGui::TextDisabled(Status->FocusAllowed
+                                    ? "Gating on the target being running instead of focused."
+                                    : "Clicking paused: the selected application is not running.");
         } else if (!Status->FocusAllowed) {
             ImGui::TextDisabled(Config.TargetApplication
                                     ? "Clicking paused: focus the selected application."
@@ -322,44 +298,209 @@ auto Application::draw_numeric_control(const char* Label, int& Value, const int 
     return Changed;
 }
 
-auto Application::draw_binding(const char* Label, Types::KeyChord& Binding) -> bool {
-    auto Changed = false;
-    const auto Current = std::ranges::find_if(
-        BindableKeys, [&Binding](const auto& Pair) { return Pair.first == Binding.KeyCode; });
-    const auto* Preview = Current == BindableKeys.end() ? "Unknown" : Current->second;
+auto Application::draw_channel(const char* Label, Types::ChannelConfiguration& Channel,
+                               const Types::MouseButton Button, bool& EnabledState,
+                               const Types::NumericEditTarget RateTarget,
+                               const Types::NumericEditTarget OffsetTarget,
+                               const Types::NumericEditTarget StartTarget,
+                               const Types::NumericEditTarget MultiplierTarget,
+                               const Types::NumericEditTarget GapTarget,
+                               const Types::BindingTarget BindingTarget) -> bool {
     ImGui::PushID(Label);
-    ImGui::TextUnformatted(Label);
-    ImGui::SetNextItemWidth(120.0F);
-    if (ImGui::BeginCombo("##key", Preview)) {
-        for (const auto& [Code, Name] : BindableKeys) {
-            if (ImGui::Selectable(Name, Binding.KeyCode == static_cast<std::uint16_t>(Code))) {
-                Binding.KeyCode = static_cast<std::uint16_t>(Code);
-                Changed = true;
-            }
+    // The header spans the full row, so it must yield hit testing to the checkbox drawn over it.
+    const auto Expanded = ImGui::CollapsingHeader(
+        Label, ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
+    const auto CheckboxWidth = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x +
+                               ImGui::CalcTextSize("Enabled").x;
+    ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - CheckboxWidth);
+    if (ImGui::Checkbox("Enabled", &EnabledState)) {
+        // Enabled state is owned by the backend and deliberately never persisted.
+        if (auto Result = Daemon.set_enabled(Button, EnabledState); !Result) {
+            EnabledState = false;
+            set_error(Result.error().describe());
         }
-        ImGui::EndCombo();
     }
+    if (!Expanded) {
+        ImGui::PopID();
+        return false;
+    }
+
+    auto Changed = false;
+    ImGui::Indent();
+    auto Mode = static_cast<int>(Channel.Mode);
+    Changed |= ImGui::RadioButton("Normal", &Mode, static_cast<int>(Types::OperatingMode::Normal));
     ImGui::SameLine();
-    Changed |= ImGui::Checkbox("Ctrl", &Binding.Control);
+    Changed |= ImGui::RadioButton("Additive", &Mode, static_cast<int>(Types::OperatingMode::Additive));
     ImGui::SameLine();
-    Changed |= ImGui::Checkbox("Alt", &Binding.Alt);
+    Changed |= ImGui::RadioButton("Hold", &Mode, static_cast<int>(Types::OperatingMode::Hold));
+    Channel.Mode = static_cast<Types::OperatingMode>(Mode);
+    switch (Channel.Mode) {
+    case Types::OperatingMode::Additive:
+        ImGui::TextDisabled("Fills physical clicking up to the configured target rate.");
+        break;
+    case Types::OperatingMode::Hold:
+        ImGui::TextDisabled("Clicks at the configured rate while you hold this button.");
+        ImGui::TextDisabled("The real button is captured while armed.");
+        break;
+    default:
+        ImGui::TextDisabled("Clicks continuously while enabled.");
+        break;
+    }
+
+    auto Unit = static_cast<int>(Channel.Unit);
+    Changed |= ImGui::RadioButton("Use CPS", &Unit, static_cast<int>(Types::RateUnit::Cps));
     ImGui::SameLine();
-    Changed |= ImGui::Checkbox("Shift", &Binding.Shift);
-    ImGui::SameLine();
-    Changed |= ImGui::Checkbox("Super", &Binding.Super);
+    Changed |= ImGui::RadioButton("Use MS", &Unit, static_cast<int>(Types::RateUnit::Milliseconds));
+    Channel.Unit = static_cast<Types::RateUnit>(Unit);
+
+    if (Channel.Unit == Types::RateUnit::Cps) {
+        auto Cps = static_cast<int>(Channel.Cps);
+        Changed |= draw_numeric_control("CPS", Cps, 1, 1000, RateTarget);
+        Channel.Cps = static_cast<std::uint16_t>(Cps);
+    } else {
+        auto Delay = static_cast<int>(Channel.Delay.count());
+        Changed |= draw_numeric_control("Delay (MS)", Delay, 1, 10000, RateTarget);
+        Channel.Delay = std::chrono::milliseconds{Delay};
+    }
+
+    auto Offset = static_cast<int>(Channel.RateOffset);
+    const auto OffsetMaximum = Channel.Unit == Types::RateUnit::Cps ? 1000 : 10000;
+    Changed |= draw_numeric_control(
+        Channel.Unit == Types::RateUnit::Cps ? "Offset (CPS)" : "Offset (MS)",
+        Offset, 0, OffsetMaximum, OffsetTarget);
+    Channel.RateOffset = static_cast<std::uint16_t>(Offset);
+
+    if (Channel.Unit == Types::RateUnit::Cps) {
+        const auto Minimum = std::max(1, static_cast<int>(Channel.Cps) - Offset);
+        const auto Maximum = std::min(1000, static_cast<int>(Channel.Cps) + Offset);
+        ImGui::TextDisabled("Effective range: %d-%d CPS", Minimum, Maximum);
+    } else {
+        const auto Base = static_cast<int>(Channel.Delay.count());
+        ImGui::TextDisabled("Effective range: %d-%d MS", std::max(1, Base - Offset),
+                            std::min(10000, Base + Offset));
+    }
+
+    if (Channel.Mode == Types::OperatingMode::Additive) {
+        auto Start = static_cast<int>(Channel.AdditiveStartCps);
+        Changed |= draw_numeric_control("Additive start (CPS)", Start, 0, 1000, StartTarget);
+        Channel.AdditiveStartCps = static_cast<std::uint16_t>(Start);
+        ImGui::TextDisabled(Channel.AdditiveStartCps == 0
+                                ? "0 always fills in; raise it to only add above a physical rate."
+                                : "Adds clicks only while you click at or above this rate.");
+    }
+
+    // The additive controller already produces a continuous stream, so bursting is meaningless.
+    const auto BurstAllowed = Channel.Mode != Types::OperatingMode::Additive;
+    ImGui::BeginDisabled(!BurstAllowed);
+    auto Multiplier = static_cast<int>(Channel.ClickMultiplier);
+    Changed |= draw_numeric_control("Clicks per click", Multiplier, 1, 10, MultiplierTarget);
+    Channel.ClickMultiplier = static_cast<std::uint8_t>(Multiplier);
+    if (Channel.ClickMultiplier > 1) {
+        auto Gap = static_cast<int>(Channel.MultiplierGap.count());
+        Changed |= draw_numeric_control("Gap between clicks (MS)", Gap, 5, 150, GapTarget);
+        Channel.MultiplierGap = std::chrono::milliseconds{Gap};
+        Changed |= ImGui::Checkbox("Multiply my own clicks too", &Channel.MultiplyPhysicalClicks);
+        ImGui::TextDisabled("A %d-click burst spans %d MS, so the rate caps near %d CPS.",
+                            Multiplier, burst_span_ms(Channel),
+                            std::max(1, 1000 / std::max(1, burst_span_ms(Channel))));
+    }
+    ImGui::EndDisabled();
+    if (!BurstAllowed) ImGui::TextDisabled("Additive mode already fills the gaps for you.");
+
+    Changed |= draw_binding("Toggle this button", Channel.ToggleBinding, BindingTarget);
+    ImGui::Unindent();
     ImGui::PopID();
     return Changed;
 }
 
-auto Application::refresh_window_candidates() -> void {
-    if (!FocusTrackerReady) {
-        WindowCandidates.clear();
+auto Application::draw_channel_status(const char* Label, const Types::ChannelStatus& Channel,
+                                      const Types::ChannelConfiguration& Settings) -> void {
+    if (!Channel.Enabled) {
+        ImGui::TextDisabled("%s: off", Label);
         return;
     }
-    WindowCandidates = FocusTracker.windows();
-    std::erase_if(WindowCandidates, [this](const Types::WindowCandidate& Candidate) {
-        return Candidate.WindowId == OwnWindowId;
-    });
+    if (!Channel.AdditiveGateOpen) {
+        ImGui::Text("%s: %.0f physical CPS - waiting for %u CPS", Label, Channel.PhysicalCps,
+                    static_cast<unsigned int>(Settings.AdditiveStartCps));
+        return;
+    }
+    ImGui::Text("%s: %.0f physical + %.0f added CPS", Label, Channel.PhysicalCps, Channel.EmittedCps);
+}
+
+auto Application::draw_binding(const char* Label, Types::KeyChord& Binding,
+                               const Types::BindingTarget Target) -> bool {
+    ImGui::PushID(Label);
+    ImGui::TextUnformatted(Label);
+    const auto Capturing = CaptureTarget == Target;
+    if (Capturing) {
+        ImGui::BeginDisabled();
+        // Deliberately no cancel button: clicking it would itself be captured.
+        ImGui::Button("Press any key or mouse button...  (Esc to cancel)", ImVec2{-1.0F, 0.0F});
+        ImGui::EndDisabled();
+    } else {
+        const auto Name = Utils::KeyNames::chord_name(Binding);
+        ImGui::BeginDisabled(CaptureTarget != Types::BindingTarget::None);
+        if (ImGui::Button(Name.c_str(), ImVec2{-1.0F, 0.0F})) {
+            CaptureTarget = Target;
+            CaptureToken = NextCaptureToken++;
+            if (auto Result = Daemon.begin_binding_capture(CaptureToken); !Result) {
+                CaptureTarget = Types::BindingTarget::None;
+                set_error(Result.error().describe());
+            }
+        }
+        ImGui::EndDisabled();
+    }
+    if (Utils::KeyNames::is_mouse_button(Binding.KeyCode)) {
+        ImGui::TextColored(WarningColour, "Every %s click will trigger this.",
+                           Utils::KeyNames::display_name(Binding.KeyCode).c_str());
+    }
+    ImGui::PopID();
+    // The binding is written by apply_capture when the daemon reports the result.
+    return false;
+}
+
+auto Application::apply_capture() -> bool {
+    const auto Capture = Daemon.take_capture();
+    if (!Capture) return false;
+    // A result for a capture this widget already abandoned is harmless to drop.
+    if (Capture->Token != CaptureToken || CaptureTarget == Types::BindingTarget::None) return false;
+    const auto Target = std::exchange(CaptureTarget, Types::BindingTarget::None);
+    if (Capture->Outcome != Types::CaptureOutcome::Captured) return false;
+    switch (Target) {
+    case Types::BindingTarget::LeftToggle: Config.Left.ToggleBinding = Capture->Chord; break;
+    case Types::BindingTarget::RightToggle: Config.Right.ToggleBinding = Capture->Chord; break;
+    case Types::BindingTarget::Exit: Config.ExitBinding = Capture->Chord; break;
+    default: return false;
+    }
+    return true;
+}
+
+auto Application::refresh_application_candidates() -> void {
+    // Processes first: on Wayland this is the only source that sees a native client, which owns no
+    // X11 toplevel. X11 windows are then merged in, upgrading an entry to focus-trackable.
+    Inventory.refresh();
+    ApplicationCandidates = Inventory.applications();
+
+    if (FocusTrackerReady) {
+        for (auto& Toplevel : FocusTracker.windows()) {
+            if (Toplevel.WindowId == OwnWindowId) continue;
+            auto Identity = Inventory.identify(Toplevel.ProcessId);
+            if (Identity.empty()) Identity = Toplevel.WindowClass;
+            const auto Existing = std::ranges::find(ApplicationCandidates, Identity,
+                                                    &Types::ApplicationCandidate::Identity);
+            if (Existing != ApplicationCandidates.end()) {
+                Existing->WindowClass = std::move(Toplevel.WindowClass);
+                Existing->WindowId = Toplevel.WindowId;
+                Existing->Source = Types::ApplicationSource::Window;
+                continue;
+            }
+            // An X11 window the inventory did not see belongs to something the session did not
+            // launch as an application, such as a game started straight from a terminal.
+            Toplevel.Identity = std::move(Identity);
+            ApplicationCandidates.push_back(std::move(Toplevel));
+        }
+    }
+    Input::ApplicationInventory::sort_candidates(ApplicationCandidates);
 }
 
 auto Application::save_and_send() -> void {

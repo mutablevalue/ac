@@ -23,10 +23,11 @@ public:
 
     auto initialize() -> std::expected<void, Utils::Error>;
     auto drain_changes() -> bool;
-    [[nodiscard]] auto windows() const -> std::vector<Types::WindowCandidate>;
+    [[nodiscard]] auto windows() const -> std::vector<Types::ApplicationCandidate>;
     [[nodiscard]] auto descriptor() const noexcept -> int;
-    [[nodiscard]] auto focus_state(const std::optional<std::string>& TargetApplication,
-                                   std::uint64_t OwnWindowId) const -> Types::WindowFocusState;
+    // Reports what the compositor exposes about the focused window. Deciding whether that matches
+    // the configured target needs the process inventory and therefore belongs to the caller.
+    [[nodiscard]] auto focus_state(std::uint64_t OwnWindowId) const -> Types::WindowFocusState;
 
 private:
     class Impl;

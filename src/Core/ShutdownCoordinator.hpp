@@ -7,16 +7,20 @@ namespace Autoclicker::Core {
 
 class ShutdownCoordinator final {
 public:
-    explicit ShutdownCoordinator(ClickScheduler& Scheduler);
+    ShutdownCoordinator(ClickScheduler& LeftScheduler, ClickScheduler& RightScheduler);
 
-    auto set_enabled(bool Enabled, ClickScheduler::TimePoint Now) -> void;
+    auto set_enabled(Types::MouseButton Button, bool Enabled, ClickScheduler::TimePoint Now) -> void;
     auto begin_shutdown() -> void;
     auto mark_stopped() noexcept -> void;
+    [[nodiscard]] auto enabled(Types::MouseButton Button) const noexcept -> bool;
     [[nodiscard]] auto state() const noexcept -> Types::LifecycleState;
     [[nodiscard]] auto shutting_down() const noexcept -> bool;
 
 private:
-    ClickScheduler& SchedulerValue;
+    [[nodiscard]] auto scheduler_for(Types::MouseButton Button) const noexcept -> ClickScheduler&;
+
+    ClickScheduler& Left;
+    ClickScheduler& Right;
     Types::LifecycleState State{Types::LifecycleState::Disabled};
 };
 

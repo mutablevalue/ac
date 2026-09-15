@@ -6,7 +6,9 @@
 namespace Autoclicker::Types {
 
 enum class InputDeviceKind { Mouse, Keyboard };
-enum class HotkeyAction { ToggleAutoclicker, ExitAutoclicker };
+enum class MouseButton { Left, Right };
+enum class HotkeyAction { ToggleLeftClicker, ToggleRightClicker, ExitAutoclicker };
+enum class CaptureOutcome { Captured, Cancelled, TimedOut };
 
 struct InputDeviceInfo final {
     std::string Id;
